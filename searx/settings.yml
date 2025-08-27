@@ -88,8 +88,11 @@ server:
   image_proxy: false
   http_protocol_version: "1.0"
   method: "GET"      # ← Allow GET queries (useful for API testing)  
-  cors: true 
+    cors: true
   default_http_headers:
+    Access-Control-Allow-Origin: "*"
+    Access-Control-Allow-Methods: "GET, POST, OPTIONS"
+    Access-Control-Allow-Headers: "*"
     X-Content-Type-Options: nosniff
     X-Download-Options: noopen
     X-Robots-Tag: noindex, nofollow
