@@ -12,9 +12,14 @@ from python_socks import parse_proxy_url, ProxyConnectionError, ProxyTimeoutErro
 
 from searx import logger
 
+# --- Optional uvloop setup ---
 if sys.platform != "win32":
-    import uvloop
-    uvloop.install()
+    try:
+        import uvloop
+        uvloop.install()
+    except ImportError:
+        pass  # uvloop is not available; fallback to default loop
+# -----------------------------
 
 logger = logger.getChild('searx.network.client')
 LOOP = None
@@ -22,22 +27,7 @@ SSLCONTEXTS: Dict[Any, SSLContext] = {}
 
 
 def shuffle_ciphers(ssl_context: SSLContext):
-    """Shuffle httpx's default ciphers of a SSL context randomly.
-
-    From `What Is TLS Fingerprint and How to Bypass It`_
-
-    > When implementing TLS fingerprinting, servers can't operate based on a
-    > locked-in whitelist database of fingerprints.  New fingerprints appear
-    > when web clients or TLS libraries release new versions. So, they have to
-    > live off a blocklist database instead.
-    > ...
-    > It's safe to leave the first three as is but shuffle the remaining ciphers
-    > and you can bypass the TLS fingerprint check.
-
-    .. _What Is TLS Fingerprint and How to Bypass It:
-       https://www.zenrows.com/blog/what-is-tls-fingerprint#how-to-bypass-tls-fingerprinting
-
-    """
+    """Shuffle httpx's default ciphers of a SSL context randomly."""
     c_list = [cipher["name"] for cipher in ssl_context.get_ciphers()]
     sc_list, c_list = c_list[:3], c_list[3:]
     random.shuffle(c_list)
@@ -53,21 +43,7 @@ def get_sslcontexts(proxy_url=None, cert=None, verify=True, trust_env=True):
 
 
 class AsyncHTTPTransportNoHttp(httpx.AsyncHTTPTransport):
-    """Block HTTP request
-
-    The constructor is blank because httpx.AsyncHTTPTransport.__init__ creates an SSLContext unconditionally:
-    https://github.com/encode/httpx/blob/0f61aa58d66680c239ce43c8cdd453e7dc532bfc/httpx/_transports/default.py#L271
-
-    Each SSLContext consumes more than 500kb of memory, since there is about one network per engine.
-
-    In consequence, this class overrides all public methods
-
-    For reference: https://github.com/encode/httpx/issues/2298
-    """
-
     def __init__(self, *args, **kwargs):
-        # pylint: disable=super-init-not-called
-        # this on purpose if the base class is not called
         pass
 
     async def handle_async_request(self, request):
@@ -79,21 +55,11 @@ class AsyncHTTPTransportNoHttp(httpx.AsyncHTTPTransport):
     async def __aenter__(self):
         return self
 
-    async def __aexit__(
-        self,
-        exc_type=None,
-        exc_value=None,
-        traceback=None,
-    ) -> None:
+    async def __aexit__(self, exc_type=None, exc_value=None, traceback=None) -> None:
         pass
 
 
 class AsyncProxyTransportFixed(AsyncProxyTransport):
-    """Fix httpx_socks.AsyncProxyTransport
-
-    Map python_socks exceptions to httpx.ProxyError exceptions
-    """
-
     async def handle_async_request(self, request):
         try:
             return await super().handle_async_request(request)
@@ -106,10 +72,6 @@ class AsyncProxyTransportFixed(AsyncProxyTransport):
 
 
 def get_transport_for_socks_proxy(verify, http2, local_address, proxy_url, limit, retries):
-    # support socks5h (requests compatibility):
-    # https://requests.readthedocs.io/en/master/user/advanced/#socks
-    # socks5://   hostname is resolved on client side
-    # socks5h://  hostname is resolved on proxy side
     rdns = False
     socks5h = 'socks5h://'
     if proxy_url.startswith(socks5h):
@@ -137,7 +99,6 @@ def get_transport_for_socks_proxy(verify, http2, local_address, proxy_url, limit
 def get_transport(verify, http2, local_address, proxy_url, limit, retries):
     verify = get_sslcontexts(None, None, verify, True) if verify is True else verify
     return httpx.AsyncHTTPTransport(
-        # pylint: disable=protected-access
         verify=verify,
         http2=http2,
         limits=limit,
@@ -148,7 +109,6 @@ def get_transport(verify, http2, local_address, proxy_url, limit, retries):
 
 
 def new_client(
-    # pylint: disable=too-many-arguments
     enable_http,
     verify,
     enable_http2,
@@ -166,7 +126,6 @@ def new_client(
         max_keepalive_connections=max_keepalive_connections,
         keepalive_expiry=keepalive_expiry,
     )
-    # See https://www.python-httpx.org/advanced/#routing
     mounts = {}
     for pattern, proxy_url in proxies.items():
         if not enable_http and pattern.startswith('http://'):
@@ -183,9 +142,7 @@ def new_client(
 
     transport = get_transport(verify, enable_http2, local_address, None, limit, retries)
 
-    event_hooks = None
-    if hook_log_response:
-        event_hooks = {'response': [hook_log_response]}
+    event_hooks = {'response': [hook_log_response]} if hook_log_response else None
 
     return httpx.AsyncClient(
         transport=transport,
@@ -200,7 +157,6 @@ def get_loop():
 
 
 def init():
-    # log
     for logger_name in (
         'httpx',
         'httpcore.proxy',
@@ -212,7 +168,6 @@ def init():
     ):
         logging.getLogger(logger_name).setLevel(logging.WARNING)
 
-    # loop
     def loop_thread():
         global LOOP
         LOOP = asyncio.new_event_loop()
@@ -225,5 +180,5 @@ def init():
     )
     thread.start()
 
-
 init()
+
