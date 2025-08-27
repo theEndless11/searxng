@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: searxng
+    env: python
+    repo: https://github.com/theEndless11/searxng
+    branch: master
+    buildCommand: |
+      pip install -r requirements.txt
+    startCommand: |
+      python manage run
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11
