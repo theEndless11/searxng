@@ -87,7 +87,8 @@ server:
   secret_key: "ultrasecretkey"
   image_proxy: false
   http_protocol_version: "1.0"
-  method: "GET"                  # ← Allow GET queries (useful for API testing)
+  method: "GET"      # ← Allow GET queries (useful for API testing)  
+  cors: true 
   default_http_headers:
     X-Content-Type-Options: nosniff
     X-Download-Options: noopen
