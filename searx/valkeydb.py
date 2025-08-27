@@ -20,12 +20,18 @@ A valkey DB connect can be tested by::
 from __future__ import annotations
 
 import os
-import pwd
+import sys
 import logging
 import warnings
 
 import valkey
 from searx import get_setting
+
+# Import pwd only on Unix-like systems
+if sys.platform != 'win32':
+    import pwd
+else:
+    pwd = None  # dummy for Windows
 
 _CLIENT: valkey.Valkey | None = None
 logger = logging.getLogger(__name__)
@@ -61,6 +67,9 @@ def initialize():
         return True
     except valkey.exceptions.ValkeyError:
         _CLIENT = None
-        _pw = pwd.getpwuid(os.getuid())
-        logger.exception("[%s (%s)] can't connect valkey DB ...", _pw.pw_name, _pw.pw_uid)
+        if pwd is not None:
+            _pw = pwd.getpwuid(os.getuid())
+            logger.exception("[%s (%s)] can't connect valkey DB ...", _pw.pw_name, _pw.pw_uid)
+        else:
+            logger.exception("Can't connect valkey DB ... (pwd module unavailable on this platform)")
     return False

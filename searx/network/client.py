@@ -1,6 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-or-later
-# pylint: disable=missing-module-docstring, global-statement
-
+import sys
 import asyncio
 import logging
 import random
@@ -11,13 +9,12 @@ from typing import Any, Dict
 import httpx
 from httpx_socks import AsyncProxyTransport
 from python_socks import parse_proxy_url, ProxyConnectionError, ProxyTimeoutError, ProxyError
-import uvloop
 
 from searx import logger
 
-
-uvloop.install()
-
+if sys.platform != "win32":
+    import uvloop
+    uvloop.install()
 
 logger = logger.getChild('searx.network.client')
 LOOP = None
@@ -116,7 +113,7 @@ def get_transport_for_socks_proxy(verify, http2, local_address, proxy_url, limit
     rdns = False
     socks5h = 'socks5h://'
     if proxy_url.startswith(socks5h):
-        proxy_url = 'socks5://' + proxy_url[len(socks5h) :]
+        proxy_url = 'socks5://' + proxy_url[len(socks5h):]
         rdns = True
 
     proxy_type, proxy_host, proxy_port, proxy_username, proxy_password = parse_proxy_url(proxy_url)

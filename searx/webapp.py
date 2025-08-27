@@ -121,6 +121,9 @@ import searx.search
 from searx.network import stream as http_stream, set_context_network_name
 from searx.search.checker import get_result as checker_get_result
 
+print("Template path from settings:", settings['ui']['templates_path'])
+
+
 
 logger = logger.getChild('webapp')
 
@@ -1378,7 +1381,7 @@ def init():
 
     # check secret_key in production
 
-    if not app.debug and get_setting("server.secret_key") == 'ultrasecretkey':
+    if not app.debug and get_setting("server.secret_key") == 'nkjsjkdknqjsq98e3idajshuq2oknqwdo932e3i':
         logger.error("server.secret_key is not changed. Please use something else instead of ultrasecretkey.")
         sys.exit(1)
 
