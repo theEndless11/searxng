@@ -6,7 +6,7 @@ services:
     branch: master
     buildCommand: |
       pip install -r requirements.txt
-    startCommand: ./manage run
+    startCommand: ./manage services start
     envVars:
       - key: PYTHON_VERSION
         value: 3.11
