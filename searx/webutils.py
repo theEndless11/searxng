@@ -1,396 +1,337 @@
-import requests
-import trafilatura
-from urllib.parse import urlparse
-from transformers import pipeline
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# pylint: disable=missing-module-docstring, invalid-name
+
+from __future__ import annotations
+
+import os
+import pathlib
+import csv
+import hashlib
+import hmac
 import re
-import warnings
-import time
+import itertools
+import json
+from datetime import datetime, timedelta
+from typing import Iterable, List, Tuple, TYPE_CHECKING
 
-# Suppress transformer warnings
-warnings.filterwarnings("ignore", message=".*max_length.*max_new_tokens.*")
+from io import StringIO
+from codecs import getincrementalencoder
 
-# Load summarizer once
-print("Loading summarization model...")
-summarizer = pipeline("summarization", model="Falconsai/text_summarization")
-print("Model loaded successfully!")
+from flask_babel import gettext, format_date  # type: ignore
 
-# --- CONFIG ---
-SEARXNG_URL = "http://localhost:8888"
-MIN_CONTENT_LENGTH = 400
-MAX_CONTENT_LENGTH = 10000  # Limit very long articles for processing efficiency
+from searx import logger, get_setting
 
-SKIP_DOMAINS = [
-    "youtube.com", "reddit.com", "twitter.com", "facebook.com", "instagram.com",
-    "tiktok.com", "pinterest.com", "linkedin.com", "quora.com",
-    "amazon.com", "ebay.com", "shopify.com", "etsy.com",
-    "wikipedia.org",  # Often too long and encyclopedic
-    "fandom.com", "wikia.com"
-]
+from searx.engines import DEFAULT_CATEGORY
 
-# Quality content domains (prioritize these)
-QUALITY_DOMAINS = [
-    "reuters.com", "bbc.com", "cnn.com", "npr.org", "apnews.com",
-    "theguardian.com", "nytimes.com", "wsj.com", "bloomberg.com",
-    "techcrunch.com", "arstechnica.com", "wired.com", "theverge.com",
-    "nature.com", "sciencedirect.com", "pubmed.ncbi.nlm.nih.gov"
-]
+if TYPE_CHECKING:
+    from searx.enginelib import Engine
+    from searx.results import ResultContainer
+    from searx.search import SearchQuery
+    from searx.results import UnresponsiveEngine
 
-def calculate_dynamic_params(word_count, target_compression=0.3):
-    """Dynamic parameter calculation based on input length and desired compression"""
-    target_words = max(15, int(word_count * target_compression))
-    target_tokens = int(target_words * 1.3)
-    
-    min_tokens = max(10, target_tokens - 15)
-    max_tokens = target_tokens + 25
-    
-    return {
-        "max_new_tokens": max_tokens,
-        "min_length": min_tokens,
-        "target_words": target_words
+VALID_LANGUAGE_CODE = re.compile(r'^[a-z]{2,3}(-[a-zA-Z]{2})?$')
+
+logger = logger.getChild('webutils')
+
+timeout_text = gettext('timeout')
+parsing_error_text = gettext('parsing error')
+http_protocol_error_text = gettext('HTTP protocol error')
+network_error_text = gettext('network error')
+ssl_cert_error_text = gettext("SSL error: certificate validation has failed")
+exception_classname_to_text = {
+    None: gettext('unexpected crash'),
+    'timeout': timeout_text,
+    'asyncio.TimeoutError': timeout_text,
+    'httpx.TimeoutException': timeout_text,
+    'httpx.ConnectTimeout': timeout_text,
+    'httpx.ReadTimeout': timeout_text,
+    'httpx.WriteTimeout': timeout_text,
+    'httpx.HTTPStatusError': gettext('HTTP error'),
+    'httpx.ConnectError': gettext("HTTP connection error"),
+    'httpx.RemoteProtocolError': http_protocol_error_text,
+    'httpx.LocalProtocolError': http_protocol_error_text,
+    'httpx.ProtocolError': http_protocol_error_text,
+    'httpx.ReadError': network_error_text,
+    'httpx.WriteError': network_error_text,
+    'httpx.ProxyError': gettext("proxy error"),
+    'searx.exceptions.SearxEngineCaptchaException': gettext("CAPTCHA"),
+    'searx.exceptions.SearxEngineTooManyRequestsException': gettext("too many requests"),
+    'searx.exceptions.SearxEngineAccessDeniedException': gettext("access denied"),
+    'searx.exceptions.SearxEngineAPIException': gettext("server API error"),
+    'searx.exceptions.SearxEngineXPathException': parsing_error_text,
+    'KeyError': parsing_error_text,
+    'json.decoder.JSONDecodeError': parsing_error_text,
+    'lxml.etree.ParserError': parsing_error_text,
+    'ssl.SSLCertVerificationError': ssl_cert_error_text,  # for Python > 3.7
+    'ssl.CertificateError': ssl_cert_error_text,  # for Python 3.7
+}
+
+
+def get_translated_errors(unresponsive_engines: Iterable[UnresponsiveEngine]):
+    translated_errors = []
+
+    for unresponsive_engine in unresponsive_engines:
+        error_user_text = exception_classname_to_text.get(unresponsive_engine.error_type)
+        if not error_user_text:
+            error_user_text = exception_classname_to_text[None]
+        error_msg = gettext(error_user_text)
+        if unresponsive_engine.suspended:
+            error_msg = gettext('Suspended') + ': ' + error_msg
+        translated_errors.append((unresponsive_engine.engine, error_msg))
+
+    return sorted(translated_errors, key=lambda e: e[0])
+
+
+class CSVWriter:
+    """A CSV writer which will write rows to CSV file "f", which is encoded in
+    the given encoding."""
+
+    def __init__(self, f, dialect=csv.excel, encoding="utf-8", **kwds):
+        # Redirect output to a queue
+        self.queue = StringIO()
+        self.writer = csv.writer(self.queue, dialect=dialect, **kwds)
+        self.stream = f
+        self.encoder = getincrementalencoder(encoding)()
+
+    def writerow(self, row):
+        self.writer.writerow(row)
+        # Fetch UTF-8 output from the queue ...
+        data = self.queue.getvalue()
+        data = data.strip('\x00')
+        # ... and re-encode it into the target encoding
+        data = self.encoder.encode(data)
+        # write to the target stream
+        self.stream.write(data.decode())
+        # empty queue
+        self.queue.truncate(0)
+
+    def writerows(self, rows):
+        for row in rows:
+            self.writerow(row)
+
+
+def write_csv_response(csv: CSVWriter, rc: ResultContainer) -> None:  # pylint: disable=redefined-outer-name
+    """Write rows of the results to a query (``application/csv``) into a CSV
+    table (:py:obj:`CSVWriter`).  First line in the table contain the column
+    names.  The column "type" specifies the type, the following types are
+    included in the table:
+
+    - result
+    - answer
+    - suggestion
+    - correction
+
+    """
+
+    keys = ('title', 'url', 'content', 'host', 'engine', 'score', 'type')
+    csv.writerow(keys)
+
+    for res in rc.get_ordered_results():
+        row = res.as_dict()
+        row['host'] = row['parsed_url'].netloc
+        row['type'] = 'result'
+        csv.writerow([row.get(key, '') for key in keys])
+
+    for a in rc.answers:
+        row = a.as_dict()
+        row['host'] = row['parsed_url'].netloc
+        csv.writerow([row.get(key, '') for key in keys])
+
+    for a in rc.suggestions:
+        row = {'title': a, 'type': 'suggestion'}
+        csv.writerow([row.get(key, '') for key in keys])
+
+    for a in rc.corrections:
+        row = {'title': a, 'type': 'correction'}
+        csv.writerow([row.get(key, '') for key in keys])
+
+
+class JSONEncoder(json.JSONEncoder):  # pylint: disable=missing-class-docstring
+    def default(self, o):
+        if isinstance(o, datetime):
+            return o.isoformat()
+        if isinstance(o, timedelta):
+            return o.total_seconds()
+        if isinstance(o, set):
+            return list(o)
+        return super().default(o)
+
+
+def get_json_response(sq: SearchQuery, rc: ResultContainer) -> str:
+    """Returns the JSON string of the results to a query (``application/json``)"""
+    data = {
+        'query': sq.query,
+        'number_of_results': rc.number_of_results,
+        'results': [_.as_dict() for _ in rc.get_ordered_results()],
+        'answers': [_.as_dict() for _ in rc.answers],
+        'corrections': list(rc.corrections),
+        'infoboxes': rc.infoboxes,
+        'suggestions': list(rc.suggestions),
+        'unresponsive_engines': get_translated_errors(rc.unresponsive_engines),
     }
+    response = json.dumps(data, cls=JSONEncoder)
+    return response
 
-def generate_summary_flexible(text, target_compression=0.3, max_attempts=3):
-    """Generate summary with flexible parameter adjustment"""
-    word_count = len(text.split())
-    
-    for attempt in range(max_attempts):
-        try:
-            adjusted_compression = target_compression + (attempt * 0.1)
-            params = calculate_dynamic_params(word_count, adjusted_compression)
-            
-            result = summarizer(
-                text,
-                max_new_tokens=params["max_new_tokens"],
-                min_length=params["min_length"],
-                do_sample=False,
-                truncation=True,
-                early_stopping=False,
-                no_repeat_ngram_size=2
-            )
-            
-            summary = result[0]['summary_text']
-            
-            if summary.strip().endswith(('.', '!', '?')):
-                return summary, params["target_words"]
-            
-        except Exception as e:
-            continue
-    
-    # Fallback
-    try:
-        fallback_params = {
-            "max_new_tokens": max(30, word_count // 2),
-            "min_length": 15
-        }
-        result = summarizer(
-            text,
-            max_new_tokens=fallback_params["max_new_tokens"],
-            min_length=fallback_params["min_length"],
-            do_sample=False,
-            truncation=True
-        )
-        return result[0]['summary_text'], fallback_params["max_new_tokens"] // 1.3
-    except:
-        return "Unable to generate summary.", 0
 
-def improve_summary_advanced(summary):
-    """Advanced post-processing for web content"""
-    if not summary or len(summary.strip()) == 0:
-        return "Unable to generate summary."
-    
-    original_summary = summary
-    
-    # Clean up common web article patterns
-    summary = re.sub(r'\s+', ' ', summary)
-    
-    # Remove meta-commentary and web-specific fluff
-    web_patterns = [
-        r'\bthis (article|story|report|piece)\b.*?(\.|,)',
-        r'\b(according to|as reported by|sources say)\b.*?(\.|,)',
-        r'\bin (this|the) (article|story|report)\b.*?(\.|,)',
-        r'\bthe (author|reporter|writer) (says?|writes?|reports?)\b.*?(\.|,)',
-        r'\b(click here|read more|continue reading|full story)\b.*?(\.|,)',
-        r'\b(updated|published|posted|edited):\s*\d+.*?(\.|,)',
-        r'\b(tags?|categories?):\s*.*?(\.|,)',
-        r'\boverall\b,?\s*',
-        r'\bin conclusion\b,?\s*',
-        r'\bin summary\b,?\s*',
-        r'\bto summarize\b,?\s*'
-    ]
-    
-    for pattern in web_patterns:
-        summary = re.sub(pattern, '', summary, flags=re.IGNORECASE)
-    
-    # Fix incomplete sentences and trailing connectors
-    summary = re.sub(r'\s+(and|or|but|with|in|of|to|for|by|while|as|that|which)\s*\.?$', '.', summary, flags=re.IGNORECASE)
-    summary = re.sub(r'\s+\w{1,2}\.?$', '.', summary)
-    
-    # Remove duplicate phrases common in web content
-    summary = re.sub(r'\b(\w+(?:\s+\w+){0,4})\s+\1\b', r'\1', summary, flags=re.IGNORECASE)
-    
-    # Proper capitalization and punctuation
-    summary = summary.strip()
-    if summary:
-        summary = summary[0].upper() + summary[1:] if len(summary) > 1 else summary.upper()
-        if not summary.endswith(('.', '!', '?')):
-            summary += '.'
-    
-    # Final cleanup
-    summary = re.sub(r'\s+([.!?])', r'\1', summary)
-    summary = re.sub(r'([.!?])\s+', r'\1 ', summary)
-    summary = re.sub(r'\s+', ' ', summary)
-    
-    # Quality check
-    if len(summary.split()) < 8 and len(original_summary.split()) > 15:
-        return original_summary.strip()
-    
-    return summary.strip()
+def get_themes(templates_path):
+    """Returns available themes list."""
+    return os.listdir(templates_path)
 
-def assess_content_quality(text, url):
-    """Assess the quality of extracted content"""
-    score = 0
-    notes = []
-    
-    # Length check
-    word_count = len(text.split())
-    if word_count > MIN_CONTENT_LENGTH:
-        score += 2
-    if word_count > 1000:
-        score += 1
-    
-    # Domain quality
-    domain = urlparse(url).netloc.lower()
-    if any(quality in domain for quality in QUALITY_DOMAINS):
-        score += 3
-        notes.append("Quality source domain")
-    
-    # Content quality indicators
-    sentences = text.count('.') + text.count('!') + text.count('?')
-    if sentences > 5:
-        score += 1
-    
-    # Check for common low-quality indicators
-    low_quality_indicators = [
-        "subscribe to our newsletter",
-        "click here for more",
-        "advertisement",
-        "sponsored content",
-        "this page requires javascript"
-    ]
-    
-    if any(indicator in text.lower() for indicator in low_quality_indicators):
-        score -= 1
-        notes.append("Contains promotional content")
-    
-    return score, notes
 
-def fetch_search_results(query, num_results=10):
-    """Fetch search results from SearXNG"""
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; ContentSummarizer/1.0)"}
-    search_url = f"{SEARXNG_URL}/search"
-    
-    params = {
-        "q": query,
-        "format": "json",
-        "safesearch": "0",
-        "time_range": "month"  # Focus on recent content
-    }
-    
-    try:
-        response = requests.get(search_url, params=params, headers=headers, timeout=10)
-        response.raise_for_status()
-        results = response.json().get("results", [])
-        
-        # Filter and sort results
-        valid_results = []
-        for r in results[:num_results * 2]:  # Get extra to filter
-            url = r.get("url", "")
-            if url and not any(bad in url.lower() for bad in SKIP_DOMAINS):
-                valid_results.append({
-                    "url": url,
-                    "title": r.get("title", ""),
-                    "content": r.get("content", "")
-                })
-        
-        # Prioritize quality domains
-        quality_results = [r for r in valid_results if any(q in r["url"].lower() for q in QUALITY_DOMAINS)]
-        other_results = [r for r in valid_results if not any(q in r["url"].lower() for q in QUALITY_DOMAINS)]
-        
-        return (quality_results + other_results)[:num_results]
-    
-    except Exception as e:
-        print(f"Error fetching search results: {e}")
-        return []
+def get_static_file_list() -> list[str]:
+    file_list = []
+    static_path = pathlib.Path(str(get_setting("ui.static_path")))
 
-def extract_content(url, timeout=10):
-    """Extract clean content from URL"""
-    try:
-        downloaded = trafilatura.fetch_url(url, timeout=timeout)
-        if not downloaded:
-            return None
-        
-        # Extract with optimized settings for summarization
-        text = trafilatura.extract(
-            downloaded,
-            include_comments=False,
-            include_tables=True,  # Keep tables for data richness
-            include_images=False,
-            include_links=False,
-            only_with_metadata=False,
-            output_format="txt",
-            target_language="en"
-        )
-        
-        if text and len(text.strip()) > MIN_CONTENT_LENGTH:
-            # Truncate if too long for efficiency
-            if len(text) > MAX_CONTENT_LENGTH:
-                text = text[:MAX_CONTENT_LENGTH] + "..."
-            return text.strip()
-        
-        return None
-    
-    except Exception as e:
-        print(f"Error extracting content from {url}: {e}")
-        return None
-
-def search_and_summarize(query, target_compression=0.3, max_articles=5):
-    """Main function to search, extract, and summarize content"""
-    print(f"🔍 Searching for: '{query}'")
-    print(f"📡 Using SearXNG at: {SEARXNG_URL}")
-    print("-" * 60)
-    
-    # Fetch search results
-    results = fetch_search_results(query, num_results=max_articles * 2)
-    if not results:
-        print("❌ No search results found")
-        return []
-    
-    print(f"📋 Found {len(results)} potential sources")
-    
-    summaries = []
-    processed = 0
-    
-    for i, result in enumerate(results):
-        if processed >= max_articles:
-            break
-            
-        url = result["url"]
-        title = result["title"]
-        
-        print(f"\n📄 Processing [{i+1}/{len(results)}]: {title[:60]}...")
-        print(f"🌐 URL: {url}")
-        
-        # Extract content
-        content = extract_content(url)
-        if not content:
-            print("❌ Failed to extract content")
-            continue
-        
-        # Assess content quality
-        quality_score, quality_notes = assess_content_quality(content, url)
-        word_count = len(content.split())
-        
-        print(f"📊 Content: {word_count} words, Quality score: {quality_score}/5")
-        if quality_notes:
-            print(f"📝 Notes: {', '.join(quality_notes)}")
-        
-        # Skip low-quality content
-        if quality_score < 2:
-            print("❌ Content quality too low, skipping")
-            continue
-        
-        # Generate summary
-        print("🤖 Generating summary...")
-        try:
-            raw_summary, target_words = generate_summary_flexible(content, target_compression)
-            final_summary = improve_summary_advanced(raw_summary)
-            
-            summary_info = {
-                "title": title,
-                "url": url,
-                "summary": final_summary,
-                "word_count": word_count,
-                "summary_words": len(final_summary.split()),
-                "quality_score": quality_score,
-                "compression_ratio": len(final_summary.split()) / word_count
-            }
-            
-            summaries.append(summary_info)
-            processed += 1
-            
-            print(f"✅ Summary generated ({len(final_summary.split())} words)")
-            
-        except Exception as e:
-            print(f"❌ Summarization failed: {e}")
-            continue
-        
-        # Brief pause to avoid overwhelming servers
-        time.sleep(0.5)
-    
-    return summaries
-
-def display_results(summaries, query):
-    """Display formatted results"""
-    if not summaries:
-        print("\n❌ No summaries generated")
-        return
-    
-    print(f"\n{'='*80}")
-    print(f"📋 SUMMARY RESULTS FOR: '{query.upper()}'")
-    print(f"{'='*80}")
-    
-    for i, summary in enumerate(summaries, 1):
-        print(f"\n📄 [{i}] {summary['title']}")
-        print(f"🌐 {summary['url']}")
-        print(f"📊 {summary['word_count']} words → {summary['summary_words']} words ({summary['compression_ratio']:.1%} compression)")
-        print(f"⭐ Quality Score: {summary['quality_score']}/5")
-        print(f"\n📝 SUMMARY:")
-        print(f"{'-'*60}")
-        print(summary['summary'])
-        print(f"{'-'*60}")
-
-if __name__ == "__main__":
-    print("🚀 SearXNG Content Fetcher & Summarizer")
-    print("=" * 60)
-    
-    while True:
-        try:
-            query = input("\n🔍 Enter search query (or 'exit' to quit): ").strip()
-            if query.lower() == 'exit':
-                print("👋 Goodbye!")
-                break
-            
-            if not query:
-                print("❌ Please enter a search query")
+    def _walk(path: pathlib.Path):
+        for f in path.iterdir():
+            if f.name.startswith('.'):
+                # ignore hidden file
                 continue
-            
-            # Optional parameters
-            compression_input = input("🎚️ Target compression (0.2-0.5, default 0.3): ").strip()
-            try:
-                target_compression = float(compression_input) if compression_input else 0.3
-                target_compression = max(0.2, min(0.5, target_compression))
-            except:
-                target_compression = 0.3
-            
-            articles_input = input("📚 Max articles to process (1-10, default 5): ").strip()
-            try:
-                max_articles = int(articles_input) if articles_input else 5
-                max_articles = max(1, min(10, max_articles))
-            except:
-                max_articles = 5
-            
-            print(f"\n🎯 Configuration:")
-            print(f"   • Query: {query}")
-            print(f"   • Compression: {target_compression:.1%}")
-            print(f"   • Max articles: {max_articles}")
-            
-            # Run the search and summarization
-            summaries = search_and_summarize(query, target_compression, max_articles)
-            display_results(summaries, query)
-            
-        except KeyboardInterrupt:
-            print("\n👋 Goodbye!")
-            break
-        except Exception as e:
-            print(f"\n❌ An error occurred: {e}")
-            continue
+            if f.is_file():
+                file_list.append(str(f.relative_to(static_path)))
+            if f.is_dir():
+                _walk(f)
+
+    _walk(static_path)
+    return file_list
+
+
+def get_result_templates(templates_path):
+    """Return set of template paths like 'simple/result_templates/default.html'."""
+    result_templates = set()
+    for root, _, files in os.walk(templates_path):
+        if os.path.basename(root) == 'result_templates':
+            rel_path = os.path.relpath(root, templates_path)  # e.g. "simple/result_templates"
+            for filename in files:
+                full_path = os.path.join(rel_path, filename).replace(os.sep, '/')
+                result_templates.add(full_path)
+    return result_templates
+
+
+def new_hmac(secret_key, url):
+    return hmac.new(secret_key.encode(), url, hashlib.sha256).hexdigest()
+
+
+def is_hmac_of(secret_key, value, hmac_to_check):
+    hmac_of_value = new_hmac(secret_key, value)
+    return len(hmac_of_value) == len(hmac_to_check) and hmac.compare_digest(hmac_of_value, hmac_to_check)
+
+
+def prettify_url(url, max_length=74):
+    if len(url) > max_length:
+        chunk_len = int(max_length / 2 + 1)
+        return '{0}[...]{1}'.format(url[:chunk_len], url[-chunk_len:])
+    return url
+
+
+def contains_cjko(s: str) -> bool:
+    """This function check whether or not a string contains Chinese, Japanese,
+    or Korean characters. It employs regex and uses the u escape sequence to
+    match any character in a set of Unicode ranges.
+
+    Args:
+        s (str): string to be checked.
+
+    Returns:
+        bool: True if the input s contains the characters and False otherwise.
+    """
+    unicode_ranges = (
+        '\u4e00-\u9fff'  # Chinese characters
+        '\u3040-\u309f'  # Japanese hiragana
+        '\u30a0-\u30ff'  # Japanese katakana
+        '\u4e00-\u9faf'  # Japanese kanji
+        '\uac00-\ud7af'  # Korean hangul syllables
+        '\u1100-\u11ff'  # Korean hangul jamo
+    )
+    return bool(re.search(fr'[{unicode_ranges}]', s))
+
+
+def regex_highlight_cjk(word: str) -> str:
+    """Generate the regex pattern to match for a given word according
+    to whether or not the word contains CJK characters or not.
+    If the word is and/or contains CJK character, the regex pattern
+    will match standalone word by taking into account the presence
+    of whitespace before and after it; if not, it will match any presence
+    of the word throughout the text, ignoring the whitespace.
+
+    Args:
+        word (str): the word to be matched with regex pattern.
+
+    Returns:
+        str: the regex pattern for the word.
+    """
+    rword = re.escape(word)
+    if contains_cjko(rword):
+        return fr'({rword})'
+    return fr'\b({rword})(?!\w)'
+
+
+def highlight_content(content, query):
+
+    if not content:
+        return None
+
+    # ignoring html contents
+    if content.find('<') != -1:
+        return content
+
+    querysplit = query.split()
+    queries = []
+    for qs in querysplit:
+        qs = qs.replace("'", "").replace('"', '').replace(" ", "")
+        if len(qs) > 0:
+            queries.extend(re.findall(regex_highlight_cjk(qs), content, flags=re.I | re.U))
+    if len(queries) > 0:
+        regex = re.compile("|".join(map(regex_highlight_cjk, queries)))
+        return regex.sub(lambda match: f'<span class="highlight">{match.group(0)}</span>'.replace('\\', r'\\'), content)
+    return content
+
+
+def searxng_l10n_timespan(dt: datetime) -> str:  # pylint: disable=invalid-name
+    """Returns a human-readable and translated string indicating how long ago
+    a date was in the past / the time span of the date to the present.
+
+    On January 1st, midnight, the returned string only indicates how many years
+    ago the date was.
+    """
+    # TODO, check if timezone is calculated right  # pylint: disable=fixme
+    d = dt.date()
+    t = dt.time()
+    if d.month == 1 and d.day == 1 and t.hour == 0 and t.minute == 0 and t.second == 0:
+        return str(d.year)
+    if dt.replace(tzinfo=None) >= datetime.now() - timedelta(days=1):
+        timedifference = datetime.now() - dt.replace(tzinfo=None)
+        minutes = int((timedifference.seconds / 60) % 60)
+        hours = int(timedifference.seconds / 60 / 60)
+        if hours == 0:
+            return gettext('{minutes} minute(s) ago').format(minutes=minutes)
+        return gettext('{hours} hour(s), {minutes} minute(s) ago').format(hours=hours, minutes=minutes)
+    return format_date(dt)
+
+
+NO_SUBGROUPING = 'without further subgrouping'
+
+
+def group_engines_in_tab(engines: Iterable[Engine]) -> List[Tuple[str, Iterable[Engine]]]:
+    """Groups an Iterable of engines by their first non tab category (first subgroup)"""
+
+    def get_subgroup(eng):
+        non_tab_categories = [c for c in eng.categories if c not in tabs + [DEFAULT_CATEGORY]]
+        return non_tab_categories[0] if len(non_tab_categories) > 0 else NO_SUBGROUPING
+
+    def group_sort_key(group):
+        return (group[0] == NO_SUBGROUPING, group[0].lower())
+
+    def engine_sort_key(engine):
+        return (engine.about.get('language', ''), engine.name)
+
+    tabs = list(get_setting('categories_as_tabs').keys())
+    subgroups = itertools.groupby(sorted(engines, key=get_subgroup), get_subgroup)
+    sorted_groups = sorted(((name, list(engines)) for name, engines in subgroups), key=group_sort_key)
+
+    ret_val = []
+    for groupname, _engines in sorted_groups:
+        group_bang = '!' + groupname.replace(' ', '_') if groupname != NO_SUBGROUPING else ''
+        ret_val.append((groupname, group_bang, sorted(_engines, key=engine_sort_key)))
+
+    return ret_val
